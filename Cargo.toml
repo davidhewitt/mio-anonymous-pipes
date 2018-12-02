@@ -1,0 +1,12 @@
+[package]
+name = "mio-anonymous-pipes"
+version = "0.1.0"
+authors = ["David Hewitt"]
+license = "MIT"
+description = "Asynchronous wrapper for windows synchronous pipes"
+
+[dependencies]
+mio = "0.6"
+miow = "0.3"
+winapi = { version = "0.3.5", features = ["ioapiset"] }
+spsc-stream = { path = "./spsc-stream" }

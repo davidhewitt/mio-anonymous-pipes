@@ -1,0 +1,13 @@
+[package]
+authors = ["David Hewitt"]
+description = "Single-producer single-consumer thread-safe stream"
+license = "MIT"
+name = "spsc-stream"
+version = "0.1.0"
+[[bench]]
+harness = false
+name = "bench"
+
+[dependencies]
+criterion = "*"
+crossbeam = "*"
