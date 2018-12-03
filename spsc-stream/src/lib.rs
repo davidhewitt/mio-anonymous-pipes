@@ -1,121 +1,98 @@
+use std::cell::UnsafeCell;
 use std::io::{self, Read, Write};
+use std::mem;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use std::sync::{Arc, Mutex};
-
-/// Fixed-size ring buffer
-pub struct CursorBuffer {
-    // Underlying memory
-    buf: Box<[u8]>,
-    // Start of initialised region
-    start: usize,
-    // Length of initialised region (might wrap around to the start)
-    len: usize
+struct RingBuffer {
+    buf: UnsafeCell<Box<[u8]>>,
+    len: AtomicUsize,
 }
 
-impl CursorBuffer {
-    pub fn new(size: usize) -> Self {
+impl RingBuffer {
+    fn new(size: usize) -> Self {
         Self {
-            buf: vec![0; size].into_boxed_slice(),
-            start: 0,
-            len: 0
+            buf: UnsafeCell::new(vec![0; size].into_boxed_slice()),
+            len: AtomicUsize::new(0)
         }
     }
+}
 
+pub struct RingBufferReader {
+    start: usize,
+    buffer: Arc<RingBuffer>
+}
+
+impl RingBufferReader {
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.buffer.len.load(Ordering::SeqCst) == 0
     }
 
     pub fn is_full(&self) -> bool {
-        self.len == self.buf.len()
+        self.buffer.len.load(Ordering::SeqCst) == unsafe {&*self.buffer.buf.get()}.len()
     }
+}
 
-    pub fn read_from(&mut self, buf: &[u8]) -> usize {
+impl Read for RingBufferReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         use std::cmp::min;
 
-        let ringbuf_size = self.buf.len();
+        let ringbuf: &mut Box<[u8]> = unsafe {mem::transmute(self.buffer.buf.get())};
+
+        let ringbuf_capacity = ringbuf.len();
+        let ringbuf_len = self.buffer.len.load(Ordering::SeqCst);
 
         // Max number of bytes we might read
-        let buf_size = min(buf.len(), ringbuf_size - self.len);
+        let read_size = min(buf.len(), ringbuf_len);
 
-        // The index into our ring buffer where we will start writing.
-        // This is at the end of the region containing data and will wrap as that might.
-        let write_start = (self.start + self.len) % ringbuf_size;
+        buf[..read_size].copy_from_slice(&ringbuf[self.start..self.start+read_size]);
+        self.start = (self.start + read_size) % ringbuf_capacity;
+        self.buffer.len.fetch_sub(read_size, Ordering::SeqCst);
 
-        if write_start < self.start {
-            // The data in the ring wraps and we're writing to the "start" of the buffer.
-            // The most we can write is the remaining free space in the buffer, i.e. until
-            // we get back to the start of the valid data region.
-            let copy_size = min(self.start - write_start, buf_size);
-            self.buf[write_start..write_start+copy_size].copy_from_slice(&buf[..copy_size]);
-            self.len += copy_size;
-            copy_size
-        } else {
-            // Data in the ring does not wrap, so we're writing to the end of the buffer.
-            // If there's more data to write than the space at the end we'll have to
-            // do a second write to the start after.
-            let copy_size = min(ringbuf_size - write_start, buf_size);
-            self.buf[write_start..write_start+copy_size].copy_from_slice(&buf[..copy_size]);
-            self.len += copy_size;
+        Ok(read_size)
+    }
+}
 
-            // If didn't copy the entire source buffer, copy as much of the remainder as
-            // possible to the start of the ring buffer.
-            if copy_size < buf_size {
-                copy_size + self.read_from(&buf[copy_size..])
-            } else {
-                copy_size
-            }
-        }
+unsafe impl Sync for RingBufferReader {}
+unsafe impl Send for RingBufferReader {}
+
+pub struct RingBufferWriter {
+    end: usize,
+    buffer: Arc<RingBuffer>
+}
+
+impl RingBufferWriter {
+    pub fn is_empty(&self) -> bool {
+        self.buffer.len.load(Ordering::SeqCst) == 0
     }
 
-    pub fn write_to(&mut self, buf: &mut [u8]) -> usize {
+    pub fn is_full(&self) -> bool {
+        self.buffer.len.load(Ordering::SeqCst) == unsafe {&*self.buffer.buf.get()}.len()
+    }
+}
+
+unsafe impl Sync for RingBufferWriter {}
+unsafe impl Send for RingBufferWriter {}
+
+impl Write for RingBufferWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         use std::cmp::min;
 
-        let ringbuf_size = self.buf.len();
+        let ringbuf: &mut Box<[u8]> = unsafe {mem::transmute(self.buffer.buf.get())};
 
-        // Number of bytes we might read.
-        let buf_size = min(self.len, buf.len());
+        let ringbuf_capacity = ringbuf.len();
+        let ringbuf_len = self.buffer.len.load(Ordering::SeqCst);
 
-        if buf_size == 0 {
-            0
-        } else if (self.start + buf_size) % ringbuf_size <= self.start {
-            // The ring buffer wraps and we're reading out over that wrap.
-            // We need to read the data out in two pieces, starting with the slice to the end.
-            let copy_size = ringbuf_size - self.start;
-            buf[..copy_size].copy_from_slice(&self.buf[self.start..]);
-            self.start = 0;
-            self.len -= copy_size;
+        // Max number of bytes we might read
+        let max_write_size = min(buf.len(), ringbuf_capacity - ringbuf_len);
+        let space_until_end = ringbuf_capacity - self.end;
+        let write_size = min(max_write_size, space_until_end);
 
-            // Finally perform a read from the start of the ring buffer
-            copy_size + self.write_to(&mut buf[copy_size..])
-        } else {
-            // We're not performing a wrapping read, so can complete in one slice
-            buf[..buf_size].copy_from_slice(&self.buf[self.start..self.start+buf_size]);
-            self.start += buf_size;
-            self.len -= buf_size;
-            buf_size
-        }
-    }
-}
+        ringbuf[self.end..self.end+write_size].copy_from_slice(&buf[..write_size]);
+        self.end = (self.end + write_size) % ringbuf_capacity;
+        self.buffer.len.fetch_add(write_size, Ordering::SeqCst);
 
-struct CursorBufferReader {
-    buffer: Arc<Mutex<CursorBuffer>>
-}
-
-struct CursorBufferWriter {
-    buffer: Arc<Mutex<CursorBuffer>>
-}
-
-impl Read for CursorBufferReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut ringbuf = self.buffer.lock().unwrap();
-        Ok(ringbuf.write_to(buf))
-    }
-}
-
-impl Write for CursorBufferWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut ringbuf = self.buffer.lock().unwrap();
-        Ok(ringbuf.read_from(buf))
+        Ok(write_size)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -123,12 +100,12 @@ impl Write for CursorBufferWriter {
     }
 }
 
-pub fn spsc_stream(size: usize) -> (impl Write, impl Read) {
+pub fn spsc_stream(size: usize) -> (RingBufferWriter, RingBufferReader) {
 
-    let buffer = Arc::new(Mutex::new(CursorBuffer::new(size)));
+    let buffer = Arc::new(RingBuffer::new(size));
 
-    let producer = CursorBufferWriter {buffer: buffer.clone()};
-    let consumer = CursorBufferReader {buffer};
+    let producer = RingBufferWriter {end: 0, buffer: buffer.clone()};
+    let consumer = RingBufferReader {start: 0, buffer};
 
     (producer, consumer)
 }
