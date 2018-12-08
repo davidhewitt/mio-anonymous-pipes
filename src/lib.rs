@@ -7,17 +7,17 @@ use miow::pipe::{AnonRead, AnonWrite};
 
 use winapi::um::ioapiset::CancelSynchronousIo;
 
-use std::io::{self, Read, Write};
+use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}, Condvar, Mutex};
 use std::thread::{JoinHandle, spawn};
 
-extern crate spsc_stream;
-use spsc_stream::*;
+extern crate spsc_buffer;
+use spsc_buffer::*;
 
 struct WaitTag {}
 
-struct AsyncAnonReadInner {
+struct EventedAnonReadInner {
     registration: Registration,
     readiness: SetReadiness,
     done: AtomicBool,
@@ -25,18 +25,18 @@ struct AsyncAnonReadInner {
     wait_tag: Mutex<WaitTag>
 }
 
-pub struct AsyncAnonRead {
+pub struct EventedAnonRead {
     // Is an Option so it can be moved out and joined in the Drop impl.
     thread: Option<JoinHandle<()>>,
-    consumer: RingBufferReader,
-    inner: Arc<AsyncAnonReadInner>
+    consumer: SpscBufferReader,
+    inner: Arc<EventedAnonReadInner>
 }
 
-impl AsyncAnonRead {
+impl EventedAnonRead {
     pub fn new(mut pipe: AnonRead) -> Self {
         let (registration, readiness) = Registration::new2();
 
-        let (mut producer, consumer) = spsc_stream(65536);
+        let (mut producer, consumer) = spsc_buffer(65536);
 
         let done = AtomicBool::new(false);
 
@@ -44,7 +44,7 @@ impl AsyncAnonRead {
         let wait_tag = Mutex::new(WaitTag {});
 
         let inner = Arc::new(
-            AsyncAnonReadInner { registration, readiness, done, sig_buffer_not_full, wait_tag }
+            EventedAnonReadInner { registration, readiness, done, sig_buffer_not_full, wait_tag }
         );
 
         let thread = {
@@ -57,27 +57,23 @@ impl AsyncAnonRead {
                 loop {
                     if inner.done.load(Ordering::SeqCst) { break; }
 
-                    {
-                        // Read into temp buffer before we grab the lock.
-                        let result = pipe.read(&mut tmp_buf[..]);
+                    // Read into temp buffer before we grab the lock.
+                    let result = pipe.read(&mut tmp_buf[..]);
 
-                        if let Ok(nbytes) = &result {
-                            let mut written = 0usize;
+                    if let Ok(nbytes) = &result {
+                        let mut written = 0usize;
 
-                            while written < *nbytes {
-                                // Wait for buffer to clear if need be.
-                                if producer.is_full() {
-                                    let wait_tag = inner.wait_tag.lock().unwrap();
-                                    let _ = inner.sig_buffer_not_full.wait(wait_tag).unwrap();
-                                }
+                        while written < *nbytes {
+                            // Wait for buffer to clear if need be.
+                            if producer.is_full() {
+                                let wait_tag = inner.wait_tag.lock().unwrap();
+                                let _ = inner.sig_buffer_not_full.wait(wait_tag).unwrap();
+                            }
 
-                                let was_empty = producer.is_empty();
+                            written += producer.write_from_slice(&tmp_buf[written..*nbytes]);
 
-                                written += producer.write(&tmp_buf[written..*nbytes]).unwrap();
-
-                                if was_empty {
-                                    inner.readiness.set_readiness(Ready::readable()).unwrap();
-                                }
+                            if !inner.readiness.readiness().is_readable() {
+                                inner.readiness.set_readiness(Ready::readable()).unwrap();
                             }
                         }
                     }
@@ -89,23 +85,34 @@ impl AsyncAnonRead {
     }
 }
 
-impl io::Read for AsyncAnonRead {
+impl io::Read for EventedAnonRead {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let was_full = self.consumer.is_full();
 
-        match self.consumer.read(buf) {
-            Ok(nbytes) => {
-                if nbytes > 0 && was_full {
-                    self.inner.sig_buffer_not_full.notify_one();
-                }
-                Ok(nbytes)
-            },
-            Err(e) => Err(e)
+        let nbytes = self.consumer.read_to_slice(buf);
+
+        if nbytes > 0 && was_full {
+            self.inner.sig_buffer_not_full.notify_one();
         }
+
+        if self.consumer.is_empty() {
+            self.inner.readiness.set_readiness(Ready::empty()).unwrap();
+
+            // Possible race: the consumer may think the queue is empty but by the time
+            // the readiness is set the producer thread may have written data
+            //
+            // We avoid the race by re-checking the queue is empty like this, and undo the
+            // readiness setting if necessary.
+            if !self.consumer.is_empty() {
+                self.inner.readiness.set_readiness(Ready::empty()).unwrap();
+            }
+        }
+
+        Ok(nbytes)
     }
 }
 
-impl Evented for AsyncAnonRead {
+impl Evented for EventedAnonRead {
     fn register(&self,
                 poll: &Poll,
                 token: Token,
@@ -127,7 +134,7 @@ impl Evented for AsyncAnonRead {
     }
 }
 
-impl Drop for AsyncAnonRead {
+impl Drop for EventedAnonRead {
     fn drop(&mut self) {
         self.inner.done.store(true, Ordering::SeqCst);
 
@@ -136,11 +143,11 @@ impl Drop for AsyncAnonRead {
         // Stop reader thread waiting for pipe contents
         unsafe { CancelSynchronousIo(thread.as_raw_handle()); }
 
-        thread.join().expect("Could not close AsyncAnonRead worker");
+        thread.join().expect("Could not close EventedAnonRead worker");
     }
 }
 
-struct AsyncAnonWriteInner {
+struct EventedAnonWriteInner {
     registration: Registration,
     readiness: SetReadiness,
     done: AtomicBool,
@@ -148,18 +155,18 @@ struct AsyncAnonWriteInner {
     wait_tag: Mutex<WaitTag>
 }
 
-pub struct AsyncAnonWrite {
+pub struct EventedAnonWrite {
     // Is an Option so it can be moved out and joined in the Drop impl
     thread: Option<JoinHandle<()>>,
-    producer: RingBufferWriter,
-    inner: Arc<AsyncAnonWriteInner>
+    producer: SpscBufferWriter,
+    inner: Arc<EventedAnonWriteInner>
 }
 
-impl AsyncAnonWrite {
+impl EventedAnonWrite {
     pub fn new(mut pipe: AnonWrite) -> Self {
         let (registration, readiness) = Registration::new2();
 
-        let (producer, mut consumer) = spsc_stream(65536);
+        let (producer, mut consumer) = spsc_buffer(65536);
 
         let done = AtomicBool::new(false);
 
@@ -167,7 +174,7 @@ impl AsyncAnonWrite {
         let wait_tag = Mutex::new(WaitTag {});
 
         let inner = Arc::new(
-            AsyncAnonWriteInner { registration, readiness, done, sig_buffer_not_empty, wait_tag }
+            EventedAnonWriteInner { registration, readiness, done, sig_buffer_not_empty, wait_tag }
         );
 
         let thread = {
@@ -191,11 +198,9 @@ impl AsyncAnonWrite {
                             let _ = inner.sig_buffer_not_empty.wait(wait_tag).unwrap();
                         }
 
-                        let was_full = consumer.is_full();
+                        let nbytes = consumer.read_to_slice(&mut tmp_buf);
 
-                        let nbytes = consumer.read(&mut tmp_buf).unwrap();
-
-                        if was_full {
+                        if !inner.readiness.readiness().is_writable() {
                             inner.readiness.set_readiness(Ready::writable()).unwrap();
                         }
 
@@ -214,20 +219,31 @@ impl AsyncAnonWrite {
     }
 }
 
-impl io::Write for AsyncAnonWrite {
+impl io::Write for EventedAnonWrite {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let was_empty = self.producer.is_empty();
 
         // TODO: Handle the possible read errors.
-        match self.producer.write(buf) {
-            Ok(nbytes) => {
-                if nbytes > 0 && was_empty {
-                    self.inner.sig_buffer_not_empty.notify_one();
-                }
-                Ok(nbytes)
-            },
-            Err(e) => Err(e)
+        let nbytes = self.producer.write_from_slice(buf);
+
+        if nbytes > 0 && was_empty {
+            self.inner.sig_buffer_not_empty.notify_one();
         }
+
+        if self.producer.is_full() {
+            self.inner.readiness.set_readiness(Ready::empty()).unwrap();
+
+            // Possible race: the producer may think the buffer is full but by the time
+            // the readiness is set the consumer thread may have read data
+            //
+            // It is sufficient to re-check the buffer is empty, and undo the readiness
+            // setting to work around this.
+            if !self.producer.is_full() {
+                self.inner.readiness.set_readiness(Ready::writable()).unwrap();
+            }
+        }
+
+        Ok(nbytes)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -235,7 +251,7 @@ impl io::Write for AsyncAnonWrite {
     }
 }
 
-impl Evented for AsyncAnonWrite {
+impl Evented for EventedAnonWrite {
     fn register(&self,
                 poll: &Poll,
                 token: Token,
@@ -257,13 +273,13 @@ impl Evented for AsyncAnonWrite {
     }
 }
 
-impl Drop for AsyncAnonWrite {
+impl Drop for EventedAnonWrite {
     fn drop(&mut self) {
         self.inner.done.store(true, Ordering::SeqCst);
 
         // Stop the writer thread waiting for contents
         self.inner.sig_buffer_not_empty.notify_one();
 
-        self.thread.take().unwrap().join().expect("Could not close AsyncAnonWrite worker");
+        self.thread.take().unwrap().join().expect("Could not close EventedAnonWrite worker");
     }
 }

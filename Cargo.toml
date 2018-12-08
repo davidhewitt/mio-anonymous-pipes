@@ -4,9 +4,10 @@ version = "0.1.0"
 authors = ["David Hewitt"]
 license = "MIT"
 description = "Asynchronous wrapper for windows synchronous pipes"
+repository = "https://github.com/davidhewitt/mio-anonymous-pipes"
 
 [dependencies]
 mio = "0.6"
 miow = "0.3"
 winapi = { version = "0.3.5", features = ["ioapiset"] }
-spsc-stream = { path = "./spsc-stream" }
+spsc-buffer = "0.1"
