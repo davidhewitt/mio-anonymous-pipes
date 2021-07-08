@@ -166,7 +166,11 @@ impl io::Read for EventedAnonRead {
             // We avoid the race by re-checking the queue is empty like this, and undo the
             // readiness setting if necessary.
             if !self.consumer.is_empty() {
-                self.inner.readiness.set_readiness(Ready::empty())?;
+                self.inner.readiness.set_readiness(Ready::readable())?;
+            }
+
+            if !self.consumer.is_full() {
+                self.inner.sig_buffer_not_full.notify_one();
             }
         }
 
@@ -203,6 +207,8 @@ impl Evented for EventedAnonRead {
 impl Drop for EventedAnonRead {
     fn drop(&mut self) {
         self.inner.done.store(true, Ordering::SeqCst);
+        
+        self.inner.sig_buffer_not_full.notify_one();
 
         let thread = self.thread.take().unwrap();
 
@@ -356,6 +362,10 @@ impl io::Write for EventedAnonWrite {
             // setting to work around this.
             if !self.producer.is_full() {
                 self.inner.readiness.set_readiness(Ready::writable())?;
+            }
+            
+            if !self.producer.is_empty() {
+                self.inner.sig_buffer_not_empty.notify_one();
             }
         }
 
