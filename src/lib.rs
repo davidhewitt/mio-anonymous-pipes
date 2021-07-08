@@ -1,10 +1,7 @@
-extern crate mio;
-extern crate miow;
-extern crate winapi;
-
 use mio::{Evented, Poll, PollOpt, Ready, Registration, SetReadiness, Token};
 use miow::pipe::{AnonRead, AnonWrite};
-
+use parking_lot::{Condvar, Mutex};
+use spsc_buffer::*;
 use winapi::um::ioapiset::CancelSynchronousIo;
 
 use std::io;
@@ -12,12 +9,9 @@ use std::os::windows::io::AsRawHandle;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{channel, Receiver, TryRecvError},
-    Arc, Condvar, Mutex,
+    Arc,
 };
 use std::thread::{spawn, JoinHandle};
-
-extern crate spsc_buffer;
-use spsc_buffer::*;
 
 struct WaitTag {}
 
@@ -91,7 +85,7 @@ impl EventedAnonRead {
 
                 loop {
                     if inner.done.load(Ordering::SeqCst) {
-                        break;
+                        return;
                     }
 
                     // Read into temp buffer
@@ -102,11 +96,11 @@ impl EventedAnonRead {
                     while written < nbytes {
                         // Wait for buffer to clear if need be.
                         if producer.is_full() {
-                            let wait_tag = try_or_send!(inner.wait_tag.lock(), error_sender);
-                            let _ = try_or_send!(
-                                inner.sig_buffer_not_full.wait(wait_tag),
-                                error_sender
-                            );
+                            let mut wait_tag = inner.wait_tag.lock();
+                            inner.sig_buffer_not_full.wait(&mut wait_tag);
+                            if inner.done.load(Ordering::SeqCst) {
+                                return;
+                            }
                         }
 
                         written += producer.write_from_slice(&tmp_buf[written..nbytes]);
@@ -149,13 +143,7 @@ impl io::Read for EventedAnonRead {
             Err(TryRecvError::Empty) => {}
         }
 
-        let was_full = self.consumer.is_full();
-
         let nbytes = self.consumer.read_to_slice(buf);
-
-        if nbytes > 0 && was_full {
-            self.inner.sig_buffer_not_full.notify_one();
-        }
 
         if self.consumer.is_empty() {
             self.inner.readiness.set_readiness(Ready::empty())?;
@@ -168,12 +156,9 @@ impl io::Read for EventedAnonRead {
             if !self.consumer.is_empty() {
                 self.inner.readiness.set_readiness(Ready::readable())?;
             }
-
-            if !self.consumer.is_full() {
-                self.inner.sig_buffer_not_full.notify_one();
-            }
         }
 
+        self.inner.sig_buffer_not_full.notify_one();
         Ok(nbytes)
     }
 }
@@ -207,7 +192,7 @@ impl Evented for EventedAnonRead {
 impl Drop for EventedAnonRead {
     fn drop(&mut self) {
         self.inner.done.store(true, Ordering::SeqCst);
-        
+
         self.inner.sig_buffer_not_full.notify_one();
 
         let thread = self.thread.take().unwrap();
@@ -282,18 +267,18 @@ impl EventedAnonWrite {
 
                 loop {
                     if inner.done.load(Ordering::SeqCst) {
-                        break;
+                        return;
                     }
 
                     // Read into temp buffer while holding the lock
                     let nbytes = {
                         // Wait for buffer to have contents
                         if consumer.is_empty() {
-                            let wait_tag = try_or_send!(inner.wait_tag.lock(), error_sender);
-                            let _ = try_or_send!(
-                                inner.sig_buffer_not_empty.wait(wait_tag),
-                                error_sender
-                            );
+                            let mut wait_tag = inner.wait_tag.lock();
+                            inner.sig_buffer_not_empty.wait(&mut wait_tag);
+                            if inner.done.load(Ordering::SeqCst) {
+                                return;
+                            }
                         }
 
                         let nbytes = consumer.read_to_slice(&mut tmp_buf);
@@ -344,14 +329,7 @@ impl io::Write for EventedAnonWrite {
             Err(TryRecvError::Empty) => {}
         }
 
-        let was_empty = self.producer.is_empty();
-
         let nbytes = self.producer.write_from_slice(buf);
-
-        if nbytes > 0 && was_empty {
-            self.inner.sig_buffer_not_empty.notify_one();
-        }
-
         if self.producer.is_full() {
             self.inner.readiness.set_readiness(Ready::empty())?;
 
@@ -363,12 +341,9 @@ impl io::Write for EventedAnonWrite {
             if !self.producer.is_full() {
                 self.inner.readiness.set_readiness(Ready::writable())?;
             }
-            
-            if !self.producer.is_empty() {
-                self.inner.sig_buffer_not_empty.notify_one();
-            }
         }
 
+        self.inner.sig_buffer_not_empty.notify_one();
         Ok(nbytes)
     }
 
