@@ -1,5 +1,6 @@
 [package]
 name = "mio-anonymous-pipes"
+edition = "2018"
 version = "0.1.0"
 authors = ["David Hewitt"]
 license = "MIT"
@@ -11,3 +12,4 @@ mio = "0.6"
 miow = "0.3"
 winapi = { version = "0.3.5", features = ["ioapiset"] }
 spsc-buffer = "0.1"
+parking_lot = "0.11.1"
